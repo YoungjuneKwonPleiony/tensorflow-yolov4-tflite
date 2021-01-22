@@ -62,7 +62,7 @@ def main(_argv):
     model = tf.keras.Model(input_layer, bbox_tensors)
     model.summary()
 
-    if FLAGS.weights == None:
+    if FLAGS.weights == None or FLAGS.weights == 'None':
         print("Training from scratch")
     else:
         if FLAGS.weights.split(".")[len(FLAGS.weights.split(".")) - 1] == "weights":
