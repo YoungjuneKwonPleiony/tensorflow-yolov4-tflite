@@ -25,7 +25,8 @@ flags.DEFINE_boolean('save_output', True, 'save output or not')
 flags.DEFINE_float('iou', 0.45, 'iou threshold')
 flags.DEFINE_float('score', 0.25, 'score threshold')
 flags.DEFINE_integer('limit', 0, 'limit count of data')
-flags.DEFINE_boolean('voting', True, 'flag for voting')
+flags.DEFINE_integer('voting', 3, 'voting threshold')
+flags.DEFINE_integer('voting_expire', 3, 'voting expire')
 
 def bb_iou(a, b):
   # [t, l, b, r]
@@ -50,11 +51,10 @@ class VotingBucket:
       self.box = box
       self.updated = step
 
-  def __init__(self, config={}):
+  def __init__(self, flags):
     self.bucket = []
     self.step = 0
-    self.config = {'expire': 3, 'iou_threshold': 0.5, 'vote_threshold': 3}
-    self.config.update(config)
+    self.flags = flags
 
   def vote(self, bb_boxes):
     import itertools, numpy
@@ -62,12 +62,12 @@ class VotingBucket:
     self.step += 1
     for v, b in [p for p in itertools.product(self.bucket, bb_boxes) if sum(p[1]) > 0]:
       iou = bb_iou(v.box, b)
-      if iou >= self.config['iou_threshold']:
+      if iou >= self.flags.iou:
         v.update(b, self.step)
-        bb_boxes.remove(b)
+        bb_boxes.remove(b) if b in bb_boxes else None
     self.bucket += [VotingBucket.Voting(b, self.step) for b in bb_boxes]
-    self.bucket = [b for b in self.bucket if self.step - b.updated <= self.config['expire']]
-    return [b.box for b in self.bucket if b.updated == self.step and b.count >= self.config['vote_threshold']]
+    self.bucket = [b for b in self.bucket if self.step - b.updated <= self.flags.voting_expire]
+    return [b.box for b in self.bucket if b.updated == self.step and b.count >= self.flags.voting]
 
 class Detector:
   def __init__(self, flags):
@@ -79,7 +79,7 @@ class Detector:
     self.data_path = flags.data
     self.flags = flags
     self.saved_model_loaded = tf.saved_model.load(self.flags.weights, tags=[tag_constants.SERVING])
-    self.voting_bucket = VotingBucket()
+    self.voting_bucket = VotingBucket(flags)
     self.init_colors()
 
   def find_files(self, suffix):
@@ -135,9 +135,23 @@ class Detector:
     clrs = list(map(lambda x: colorsys.hsv_to_rgb(*x), hsv_tuples))
     self.colors = list(map(lambda x: (int(x[0] * 255), int(x[1] * 255), int(x[2] * 255)), clrs))
 
-  def calc_ious(self, answers, bboxs):
+  def calc_ious(self, answers, bb_boxes):
     import itertools
-    return [e for e in [(bb_iou(*p), p) for p in itertools.product(answers, bboxs[0]) if sum(p[0]) > 0 and sum(p[1])] if e[0] > 0.1]
+    return [e for e in [(bb_iou(*p), p) for p in itertools.product(answers, bb_boxes) if sum(p[0]) > 0 and sum(p[1])] if e[0] > self.flags.iou]
+
+  def calc_precision(self, answers, bb_boxes):
+    p = 0
+    if len(bb_boxes) == 0:
+      return 0
+    for b in bb_boxes:
+      p += 1 if len([(a, b) for a in answers if bb_iou(a, b) >= self.flags.iou]) > 0 else 0
+    return p / len(bb_boxes)
+
+  def calc_recall(self, answers, bb_boxes):
+    r = 0
+    for a in answers:
+      r += 1 if len([(a, b) for b in bb_boxes if bb_iou(a, b) >= self.flags.iou]) > 0 else 0
+    return r / len(answers)
 
   def draw_rect(self, np_image, bbox, color_idx=0):
     image_h, image_w, _ = np_image.shape
@@ -151,9 +165,9 @@ class Detector:
     c1, c2 = (coor[1], coor[0]), (coor[3], coor[2])
     cv2.rectangle(np_image, c1, c2, self.colors[color_idx], bbox_thick)
 
-  def save_output(self, output, np_image, ious):
-    [self.draw_rect(np_image, i[1][0], color_idx=10) for i in ious]
-    [self.draw_rect(np_image, i[1][1]) for i in ious]
+  def save_output(self, output, np_image, answers, bb_boxes):
+    [self.draw_rect(np_image, i, color_idx=10) for i in answers]
+    [self.draw_rect(np_image, i) for i in bb_boxes]
     img = Image.fromarray(np_image.astype(np.uint8))
     cv2.imwrite(output, cv2.cvtColor(np.array(img), cv2.COLOR_BGR2RGB))
 
@@ -162,11 +176,13 @@ class Detector:
     answers = self.extract_answers_for(image)
     np_image = self.load_image(image)
     pred_bbox = self.process_for_np_image(np_image)
-    bb_boxes = [self.voting_bucket.vote(pred_bbox[0][0])] if self.flags.voting else pred_bbox[0]
+    bb_boxes = self.voting_bucket.vote(pred_bbox[0][0]) if self.flags.voting > 0 else pred_bbox[0][0]
     ious = self.calc_ious(answers, bb_boxes)
+    precision = self.calc_precision(answers, bb_boxes)
+    recall = self.calc_recall(answers, bb_boxes)
     output = f'{self.flags.output}/images/{image.replace(self.data_path, "").replace(os.path.sep, "_")}'
-    self.save_output(output, np_image, ious) if self.flags.save_output else None
-    return [i[0] for i in ious], len(answers)
+    self.save_output(output, np_image, answers, bb_boxes) if self.flags.save_output else None
+    return [i[0] for i in ious], len(answers), precision, recall
 
   def images_in_data(self):
     files = sorted(self.find_files(self.flags.image_ext))
@@ -181,10 +197,9 @@ class Detector:
       e = self.evaluate_for_image(f)
       results.append({
         'file': f,
-        'avg_iou': sum(e[0]) / e[1],
-        'cnt_iou': len(e[0]),
         'ans': e[1],
-        'diff': e[1] - len(e[0])
+        'precision': e[2],
+        'recall': e[3]
       })
     pandas.DataFrame(results).to_csv(f'{FLAGS.output}/report.csv')
 
