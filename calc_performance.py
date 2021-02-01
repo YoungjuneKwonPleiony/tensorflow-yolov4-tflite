@@ -24,6 +24,50 @@ flags.DEFINE_boolean('segmented_data', True, 'segmented or not')
 flags.DEFINE_boolean('save_output', True, 'save output or not')
 flags.DEFINE_float('iou', 0.45, 'iou threshold')
 flags.DEFINE_float('score', 0.25, 'score threshold')
+flags.DEFINE_integer('limit', 0, 'limit count of data')
+flags.DEFINE_boolean('voting', True, 'flag for voting')
+
+def bb_iou(a, b):
+  # [t, l, b, r]
+  xA = max(a[1], b[1])
+  yA = max(a[0], b[0])
+  xB = min(a[3], b[3])
+  yB = min(a[2], b[2])
+  interArea = max(0, xB - xA) * max(0, yB - yA)
+  boxAArea = (a[2] - a[0]) * (a[3] - a[1])
+  boxBArea = (b[2] - b[0]) * (b[3] - b[1])
+  iou = interArea / float(boxAArea + boxBArea - interArea)
+  return iou
+
+class VotingBucket:
+  class Voting:
+    def __init__(self, box, step):
+      self.count = 0
+      self.update(box, step)
+    
+    def update(self, box, step):
+      self.count += 1
+      self.box = box
+      self.updated = step
+
+  def __init__(self, config={}):
+    self.bucket = []
+    self.step = 0
+    self.config = {'expire': 3, 'iou_threshold': 0.5, 'vote_threshold': 3}
+    self.config.update(config)
+
+  def vote(self, bb_boxes):
+    import itertools, numpy
+    bb_boxes = bb_boxes.tolist() if type(bb_boxes) == numpy.ndarray else bb_boxes
+    self.step += 1
+    for v, b in [p for p in itertools.product(self.bucket, bb_boxes) if sum(p[1]) > 0]:
+      iou = bb_iou(v.box, b)
+      if iou >= self.config['iou_threshold']:
+        v.update(b, self.step)
+        bb_boxes.remove(b)
+    self.bucket += [VotingBucket.Voting(b, self.step) for b in bb_boxes]
+    self.bucket = [b for b in self.bucket if self.step - b.updated <= self.config['expire']]
+    return [b.box for b in self.bucket if b.updated == self.step and b.count >= self.config['vote_threshold']]
 
 class Detector:
   def __init__(self, flags):
@@ -35,6 +79,7 @@ class Detector:
     self.data_path = flags.data
     self.flags = flags
     self.saved_model_loaded = tf.saved_model.load(self.flags.weights, tags=[tag_constants.SERVING])
+    self.voting_bucket = VotingBucket()
     self.init_colors()
 
   def find_files(self, suffix):
@@ -58,18 +103,6 @@ class Detector:
 
   def load_image(self, image):
     return cv2.cvtColor(cv2.imread(image), cv2.COLOR_BGR2RGB)
-
-  def bb_iou(a, b):
-    # [t, l, b, r]
-    xA = max(a[1], b[1])
-    yA = max(a[0], b[0])
-    xB = min(a[3], b[3])
-    yB = min(a[2], b[2])
-    interArea = max(0, xB - xA) * max(0, yB - yA)
-    boxAArea = (a[2] - a[0]) * (a[3] - a[1])
-    boxBArea = (b[2] - b[0]) * (b[3] - b[1])
-    iou = interArea / float(boxAArea + boxBArea - interArea)
-    return iou
 
   def process_for_np_image(self, np_image):
     image_data = cv2.resize(np_image, (self.input_size, self.input_size))
@@ -104,7 +137,7 @@ class Detector:
 
   def calc_ious(self, answers, bboxs):
     import itertools
-    return [e for e in [(Detector.bb_iou(*p), p) for p in itertools.product(answers, bboxs[0]) if sum(p[0]) > 0 and sum(p[1])] if e[0] > 0.1]
+    return [e for e in [(bb_iou(*p), p) for p in itertools.product(answers, bboxs[0]) if sum(p[0]) > 0 and sum(p[1])] if e[0] > 0.1]
 
   def draw_rect(self, np_image, bbox, color_idx=0):
     image_h, image_w, _ = np_image.shape
@@ -129,27 +162,35 @@ class Detector:
     answers = self.extract_answers_for(image)
     np_image = self.load_image(image)
     pred_bbox = self.process_for_np_image(np_image)
-    ious = self.calc_ious(answers, pred_bbox[0])
+    bb_boxes = [self.voting_bucket.vote(pred_bbox[0][0])] if self.flags.voting else pred_bbox[0]
+    ious = self.calc_ious(answers, bb_boxes)
     output = f'{self.flags.output}/images/{image.replace(self.data_path, "").replace(os.path.sep, "_")}'
     self.save_output(output, np_image, ious) if self.flags.save_output else None
     return [i[0] for i in ious], len(answers)
 
+  def images_in_data(self):
+    files = sorted(self.find_files(self.flags.image_ext))
+    return files if self.flags.limit == 0 else files[:self.flags.limit]
+
+  def evaluate_with_data(self):
+    import pandas
+    files = self.images_in_data()
+    results = []
+    for i, f in enumerate(files):
+      print(f'{i} / {len(files)}, {f}')
+      e = self.evaluate_for_image(f)
+      results.append({
+        'file': f,
+        'avg_iou': sum(e[0]) / e[1],
+        'cnt_iou': len(e[0]),
+        'ans': e[1],
+        'diff': e[1] - len(e[0])
+      })
+    pandas.DataFrame(results).to_csv(f'{FLAGS.output}/report.csv')
+
 def main(_argv):
-  import pandas
   detector = Detector(FLAGS)
-  files = detector.find_files('.png')
-  results = []
-  for i, f in enumerate(files):
-    print(f'{i} / {len(files)}')
-    e = detector.evaluate_for_image(f)
-    results.append({
-      'file': f,
-      'avg_iou': sum(e[0]) / e[1],
-      'cnt_iou': len(e[0]),
-      'ans': e[1],
-      'loss': e[1] - len(e[0])
-    })
-  pandas.DataFrame(results).to_csv(f'{FLAGS.output}/report.csv')
+  detector.evaluate_with_data()
 
 if __name__ == '__main__':
   try:
